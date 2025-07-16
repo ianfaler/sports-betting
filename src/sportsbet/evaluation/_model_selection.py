@@ -410,7 +410,7 @@ class BettorGridSearchCV(GridSearchCV, BaseBettor):
             estimator: BaseBettor,
             X: pd.DataFrame,
             Y: pd.DataFrame,
-            sample_weight: NDArray[Shape['*'], float] | None = None,  # noqa: F722
+            sample_weight: NDArray[Shape['*'], Any] | None = None,  # noqa: F722
             **kwargs: dict[str, Any],
         ) -> float:
             Y = Y[estimator.feature_names_out_]
@@ -529,11 +529,11 @@ class BettorGridSearchCV(GridSearchCV, BaseBettor):
         return [np.array([0, 1]) for _ in enumerate(self.betting_markets_)]
 
     @property
-    def betting_markets_(self: Self) -> NDArray[Shape['*'], str]:  # noqa: F722
+    def betting_markets_(self: Self) -> NDArray[Shape['*'], Any]:  # noqa: F722
         self._check_attr('betting_markets_', True, True)
         return self.best_estimator_.betting_markets_
 
     @property
-    def feature_names_out_(self: Self) -> NDArray[Shape['*'], str]:  # noqa: F722
+    def feature_names_out_(self: Self) -> NDArray[Shape['*'], Any]:  # noqa: F722
         self._check_attr('feature_names_out_', True, True)
         return self.best_estimator_.feature_names_out_
