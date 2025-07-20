@@ -18,12 +18,34 @@ from typing_extensions import Self
 
 from ... import FixturesData, ParamGrid, Schema, TrainData
 from .._base import BaseDataLoader
-from ._utils import OUTPUTS, _read_csv, _read_csvs, _read_urls_content
+from ._utils import OUTPUTS, _read_csv, _read_csvs, _read_urls_content, NetworkError, DataValidationError
 
+# Primary data sources
 MODELLING_URL = 'https://github.com/georgedouzas/sports-betting/tree/data/data/soccer/modelling'
 TRAINING_URL = 'https://raw.githubusercontent.com/georgedouzas/sports-betting/data/data/soccer/modelling/{league}_{division}_{year}.csv'
 FIXTURES_URL = 'https://raw.githubusercontent.com/georgedouzas/sports-betting/data/data/soccer/modelling/fixtures.csv'
 
+# Backup data sources (for redundancy)
+BACKUP_SOURCES = {
+    'modelling': [
+        'https://github.com/georgedouzas/sports-betting/tree/data/data/soccer/modelling',
+        # Add additional backup sources here as they become available
+    ],
+    'training': [
+        'https://raw.githubusercontent.com/georgedouzas/sports-betting/data/data/soccer/modelling/{league}_{division}_{year}.csv',
+        # Potential backup: CDN or mirror sources
+        # 'https://cdn.sportsbet-data.com/soccer/modelling/{league}_{division}_{year}.csv',
+    ],
+    'fixtures': [
+        'https://raw.githubusercontent.com/georgedouzas/sports-betting/data/data/soccer/modelling/fixtures.csv',
+        # Potential backup sources
+        # 'https://backup.sportsbet-data.com/soccer/fixtures.csv',
+    ]
+}
+
+# Cache configuration
+import logging
+logger = logging.getLogger(__name__)
 
 class SoccerDataLoader(BaseDataLoader):
     """Dataloader for soccer data.
@@ -182,22 +204,99 @@ class SoccerDataLoader(BaseDataLoader):
                 )
         return ParameterGrid(param_grid)
 
+    def _try_backup_sources(self: Self, source_type: str, format_params: dict = None) -> pd.DataFrame:
+        """Try backup sources if primary fails."""
+        sources = BACKUP_SOURCES.get(source_type, [])
+        
+        for source_url in sources:
+            try:
+                if format_params:
+                    url = source_url.format(**format_params)
+                else:
+                    url = source_url
+                
+                logger.info(f"Trying backup source: {url}")
+                
+                if source_type == 'fixtures':
+                    return _read_csv(url)
+                else:
+                    # For training data, we need multiple URLs
+                    urls = [url.format(**params) for params in self.param_grid_]
+                    return pd.concat(_read_csvs(urls))
+                    
+            except Exception as e:
+                logger.warning(f"Backup source {source_url} failed: {e}")
+                continue
+        
+        raise NetworkError(f"All backup sources failed for {source_type}")
+
     @lru_cache  # noqa: B019
     def _get_data(self: Self) -> pd.DataFrame:
-        urls = [TRAINING_URL.format(**params) for params in self.param_grid_]
-        training_data = pd.concat(_read_csvs(urls))
-        training_data['fixtures'] = False
-        fixtures_data = _read_csv(FIXTURES_URL)
-        fixtures_data['fixtures'] = True
-        data = (pd.concat([training_data, fixtures_data]) if not fixtures_data.empty else training_data).reset_index(
-            drop=True,
-        )
+        training_data = None
+        fixtures_data = None
+        
+        # Try to load training data with fallback
+        try:
+            urls = [TRAINING_URL.format(**params) for params in self.param_grid_]
+            training_data = pd.concat(_read_csvs(urls))
+            training_data['fixtures'] = False
+            logger.info(f"Successfully loaded training data with {len(training_data)} records")
+        except Exception as e:
+            logger.error(f"Primary training data source failed: {e}")
+            try:
+                training_data = self._try_backup_sources('training')
+                training_data['fixtures'] = False
+                logger.info(f"Successfully loaded training data from backup with {len(training_data)} records")
+            except Exception as backup_e:
+                logger.error(f"All training data sources failed: {backup_e}")
+                raise NetworkError("Failed to load training data from all sources") from backup_e
+        
+        # Try to load fixtures data with fallback
+        try:
+            fixtures_data = _read_csv(FIXTURES_URL)
+            fixtures_data['fixtures'] = True
+            logger.info(f"Successfully loaded fixtures data with {len(fixtures_data)} records")
+        except Exception as e:
+            logger.warning(f"Primary fixtures data source failed: {e}")
+            try:
+                fixtures_data = self._try_backup_sources('fixtures')
+                fixtures_data['fixtures'] = True
+                logger.info(f"Successfully loaded fixtures data from backup with {len(fixtures_data)} records")
+            except Exception as backup_e:
+                logger.warning(f"All fixtures data sources failed: {backup_e}")
+                # Fixtures data is optional, so we can continue without it
+                fixtures_data = pd.DataFrame()
+        
+        # Combine data
+        if training_data is not None:
+            if not fixtures_data.empty:
+                data = pd.concat([training_data, fixtures_data]).reset_index(drop=True)
+            else:
+                data = training_data.reset_index(drop=True)
+        else:
+            raise DataValidationError("No training data available")
+        
+        # Enhanced date parsing with better error handling
         try:
             data['date'] = pd.to_datetime(data['date'], format='%d/%m/%Y')
-        except ValueError:
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', category=UserWarning)
-                data['date'] = pd.to_datetime(data['date'], infer_datetime_format=True)
+            logger.info("Successfully parsed dates using primary format (%d/%m/%Y)")
+        except ValueError as e:
+            logger.warning(f"Primary date format failed: {e}, trying alternative parsing")
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', category=UserWarning)
+                    data['date'] = pd.to_datetime(data['date'], infer_datetime_format=True)
+                logger.info("Successfully parsed dates using inferred format")
+            except Exception as parse_e:
+                logger.error(f"Date parsing completely failed: {parse_e}")
+                # Keep the original date column as string if parsing fails
+                logger.warning("Keeping dates as strings due to parsing failure")
+        
+        # Basic data validation
+        if data.empty:
+            raise DataValidationError("Final dataset is empty")
+        
+        logger.info(f"Successfully loaded complete dataset with {len(data)} records")
         return data
 
     def extract_train_data(
